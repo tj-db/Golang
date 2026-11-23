@@ -25,7 +25,7 @@ var routes atomic.Value
 var db *sql.DB
 
 const (
-	serverAddress  = "serverAddress = "127.0.0.1:8080""
+	serverAddress  = "serverAddress = "127.0.0.1:8080"
 	reloadInterval = 5 * time.Second
 )
 
