@@ -1,13 +1,16 @@
 
-// Designed and written by Thomas de Beer.
-// Do not use, copy or reproduce without his explicit written consent.
-// Contact: tjdebeer@gmail.com
+ // Designed and written by Thomas de Beer.
+ // Do not use, copy or reproduce without his explicit written consent.
+ // Contact: tjdebeer@gmail.com
 
 package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,10 +32,11 @@ type routeKey struct {
 	Method string
 }
 
-type AddRouteRequest struct {
+type AddEndpointRequest struct {
 	Path         string `json:"path"`
 	Method       string `json:"method"`
 	FunctionName string `json:"function_name"`
+	FunctionBody string `json:"function_body"`
 }
 
 var routes atomic.Value
@@ -42,6 +46,7 @@ const (
 	serverAddress  = "127.0.0.1:8080"
 	reloadInterval = 5 * time.Second
 	maxRequestSize = 1024 * 1024
+	maxFunctionBodySize = 64 * 1024
 )
 
 var identifierPattern = regexp.MustCompile(
@@ -98,7 +103,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/admin/routes", addRouteHandler)
+	mux.HandleFunc("/admin/endpoints", addEndpointHandler)
 	mux.HandleFunc("/", dynamicHandler)
 
 	server := &http.Server{
@@ -267,6 +272,50 @@ func validMethod(method string) bool {
 	}
 }
 
+
+func makeDollarDelimiter(body string) (string, error) {
+	for i := 0; i < 5; i++ {
+		randomBytes := make([]byte, 16)
+
+		if _, err := rand.Read(randomBytes); err != nil {
+			return "", err
+		}
+
+		delimiter := "$api_fn_" +
+			hex.EncodeToString(randomBytes) +
+			"$"
+
+		if !strings.Contains(body, delimiter) {
+			return delimiter, nil
+		}
+	}
+
+	return "", fmt.Errorf("could not generate SQL delimiter")
+}
+
+func authenticateAdmin(r *http.Request) bool {
+	token := os.Getenv("ADMIN_TOKEN")
+
+	if token == "" {
+		log.Println("ADMIN_TOKEN is not configured")
+		return false
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+
+	if !strings.HasPrefix(authHeader, prefix) {
+		return false
+	}
+
+	providedToken := strings.TrimPrefix(authHeader, prefix)
+
+	return subtle.ConstantTimeCompare(
+		[]byte(providedToken),
+		[]byte(token),
+	) == 1
+}
+
 func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 	method := strings.ToUpper(r.Method)
 
@@ -391,7 +440,7 @@ func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func addRouteHandler(w http.ResponseWriter, r *http.Request) {
+func addEndpointHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 
@@ -403,23 +452,16 @@ func addRouteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := os.Getenv("ADMIN_TOKEN")
+	if !authenticateAdmin(r) {
+		if os.Getenv("ADMIN_TOKEN") == "" {
+			http.Error(
+				w,
+				"Admin access is not configured",
+				http.StatusServiceUnavailable,
+			)
+			return
+		}
 
-	if token == "" {
-		log.Println("ADMIN_TOKEN is not configured")
-
-		http.Error(
-			w,
-			"Route registration is not configured",
-			http.StatusServiceUnavailable,
-		)
-		return
-	}
-
-	authHeader := r.Header.Get("Authorization")
-
-	if !strings.HasPrefix(authHeader, "Bearer ") ||
-		strings.TrimPrefix(authHeader, "Bearer ") != token {
 		http.Error(
 			w,
 			"Unauthorized",
@@ -428,10 +470,14 @@ func addRouteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	r.Body = http.MaxBytesReader(
+		w,
+		r.Body,
+		maxRequestSize,
+	)
 	defer r.Body.Close()
 
-	var req AddRouteRequest
+	var req AddEndpointRequest
 
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -458,24 +504,90 @@ func addRouteHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !pathPattern.MatchString(req.Path) ||
 		!validMethod(req.Method) ||
-		!identifierPattern.MatchString(req.FunctionName) {
+		!identifierPattern.MatchString(req.FunctionName) ||
+		strings.TrimSpace(req.FunctionBody) == "" ||
+		len(req.FunctionBody) > maxFunctionBodySize {
 		http.Error(
 			w,
-			"Invalid route configuration",
+			"Invalid endpoint configuration",
 			http.StatusBadRequest,
+		)
+		return
+	}
+
+	quotedName, err := quoteIdentifier(req.FunctionName)
+
+	if err != nil {
+		http.Error(
+			w,
+			"Invalid function name",
+			http.StatusBadRequest,
+		)
+		return
+	}
+
+	delimiter, err := makeDollarDelimiter(req.FunctionBody)
+
+	if err != nil {
+		log.Println("SQL delimiter generation failed:", err)
+
+		http.Error(
+			w,
+			"Could not prepare function",
+			http.StatusInternalServerError,
 		)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(
 		r.Context(),
-		5*time.Second,
+		15*time.Second,
 	)
 	defer cancel()
 
+	tx, err := db.BeginTx(ctx, nil)
+
+	if err != nil {
+		log.Println("Transaction start failed:", err)
+
+		http.Error(
+			w,
+			"Could not begin transaction",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	defer tx.Rollback()
+
+	functionSQL := fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION public.%s(p_input jsonb)
+		RETURNS jsonb
+		LANGUAGE sql
+		AS %s
+		%s
+		%s
+	`,
+		quotedName,
+		delimiter,
+		req.FunctionBody,
+		delimiter,
+	)
+
+	if _, err := tx.ExecContext(ctx, functionSQL); err != nil {
+		log.Println("Function creation failed:", err)
+
+		http.Error(
+			w,
+			"Function creation failed",
+			http.StatusBadRequest,
+		)
+		return
+	}
+
 	var result string
 
-	err := db.QueryRowContext(
+	err = tx.QueryRowContext(
 		ctx,
 		"SELECT public.add_route($1, $2, $3)",
 		req.Path,
@@ -494,12 +606,23 @@ func addRouteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := tx.Commit(); err != nil {
+		log.Println("Transaction commit failed:", err)
+
+		http.Error(
+			w,
+			"Could not save endpoint",
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
 	if err := loadRoutes(); err != nil {
 		log.Println("Route reload failed:", err)
 
 		http.Error(
 			w,
-			"Route saved but reload failed",
+			"Endpoint saved; route reload failed",
 			http.StatusInternalServerError,
 		)
 		return
@@ -510,7 +633,7 @@ func addRouteHandler(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":        "success",
-		"message":       result,
+		"message":       "Endpoint created successfully",
 		"path":          req.Path,
 		"method":        req.Method,
 		"function_name": req.FunctionName,
