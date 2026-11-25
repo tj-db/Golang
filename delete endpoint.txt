@@ -1,0 +1,4 @@
+curl -sS -X POST "$API/admin/endpoints/delete" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"/admin/functions/inspect","method":"POST"}'

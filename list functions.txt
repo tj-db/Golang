@@ -1,0 +1,4 @@
+curl -sS -X POST "$API/admin/functions/list" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
