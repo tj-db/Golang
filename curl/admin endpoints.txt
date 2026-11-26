@@ -1,0 +1,9 @@
+curl -X POST "$API/admin/endpoints" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "path": "/project1",
+    "method": "POST",
+    "function_name": "project1_insert",
+    "function_body": "..."
+  }'
