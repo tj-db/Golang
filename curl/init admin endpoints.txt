@@ -1,0 +1,4 @@
+curl -i -X POST "$API/admin/endpoints" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"schema_name":"project_one","path":"/project1/test","method":"POST","function_name":"project1_test","function_body":"SELECT jsonb_build_object($$status$$,$$success$$,$$message$$,$$Dynamic PostgreSQL function works$$)"}'
