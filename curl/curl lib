@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+# PostgreSQL API project command reference
+# Requires API and ADMIN_TOKEN environment variables to be configured.
+
+# Stop if a command fails.
+set -e
+
+# Check that the API URL and admin token are available.
+: "${API:?Set API first, for example: API=http://158.101.223.191}"
+: "${ADMIN_TOKEN:?Set ADMIN_TOKEN first}"
+
+# Display the API configuration without revealing the admin token.
+echo "Using API: $API"
+
+# --------------------------------------------------
+# 1. TEST THE EXISTING PROJECT ENDPOINT
+# --------------------------------------------------
+
+# Call the test endpoint registered in project_one.
+curl -i -X POST "$API/project1/test" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# --------------------------------------------------
+# 2. LIST REGISTERED HTTP ENDPOINTS
+# --------------------------------------------------
+
+# Retrieve all registered routes from PostgreSQL.
+curl -i -X POST "$API/admin/endpoints/list" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# --------------------------------------------------
+# 3. LIST POSTGRESQL FUNCTIONS
+# --------------------------------------------------
+
+# Retrieve the available PostgreSQL functions.
+curl -i -X POST "$API/admin/functions/list" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# --------------------------------------------------
+# 4. INSPECT POSTGRESQL FUNCTIONS
+# --------------------------------------------------
+
+# Inspect function definitions, registered routes and dependencies.
+curl -i -X POST "$API/admin/functions/inspect" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# --------------------------------------------------
+# 5. CREATE ANOTHER PROJECT SCHEMA
+# --------------------------------------------------
+
+# Create project_two inside the main PostgreSQL database.
+# Change project_two to another valid schema name when needed.
+curl -i -X POST "$API/admin/create-schema" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"schema_name":"project_two"}'
+
+# --------------------------------------------------
+# 6. CREATE A SQL FUNCTION AND HTTP ENDPOINT
+# --------------------------------------------------
+
+# Register a SQL function inside project_one.
+# The function returns basic information about the project.
+curl -i -X POST "$API/admin/endpoints" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON'
+{
+  "schema_name": "project_one",
+  "path": "/project1/info",
+  "method": "POST",
+  "function_name": "project1_info",
+  "language": "sql",
+  "function_body": "SELECT jsonb_build_object('project', 'project_one', 'status', 'active', 'database', current_database())"
+}
+JSON
+
+# --------------------------------------------------
+# 7. CALL THE SQL ENDPOINT
+# --------------------------------------------------
+
+# Execute project1_info and retrieve the project information.
+curl -i -X POST "$API/project1/info" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# --------------------------------------------------
+# 8. CREATE A PLPGSQL FUNCTION AND HTTP ENDPOINT
+# --------------------------------------------------
+
+# Register a PL/pgSQL function that reads a name from incoming JSON.
+# The function returns a personalized greeting.
+curl -i -X POST "$API/admin/endpoints" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON'
+{
+  "schema_name": "project_one",
+  "path": "/project1/greet",
+  "method": "POST",
+  "function_name": "project1_greet",
+  "language": "plpgsql",
+  "function_body": "DECLARE person text; BEGIN person := p_input->>'name'; RETURN jsonb_build_object('message', 'Hello ' || COALESCE(person, 'there') || '!'); END;"
+}
+JSON
+
+# --------------------------------------------------
+# 9. CALL THE PLPGSQL ENDPOINT
+# --------------------------------------------------
+
+# Send a JSON request containing a name.
+curl -i -X POST "$API/project1/greet" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Thomas"}'
+
+# --------------------------------------------------
+# 10. SEND MORE COMPLEX JSON INPUT
+# --------------------------------------------------
+
+# Demonstrate that PostgreSQL functions can receive multiple JSON fields.
+curl -i -X POST "$API/project1/greet" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"John","role":"admin","active":true}'
+
+# --------------------------------------------------
+# 11. CREATE AN ENDPOINT IN PROJECT_TWO
+# --------------------------------------------------
+
+# Register a test function in the second project schema.
+# This demonstrates that projects can have independent namespaces.
+curl -i -X POST "$API/admin/endpoints" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON'
+{
+  "schema_name": "project_two",
+  "path": "/project2/test",
+  "method": "POST",
+  "function_name": "project2_test",
+  "language": "sql",
+  "function_body": "SELECT jsonb_build_object('project', 'project_two', 'status', 'success')"
+}
+JSON
+
+# --------------------------------------------------
+# 12. CALL THE SECOND PROJECT
+# --------------------------------------------------
+
+# Execute the test function registered in project_two.
+curl -i -X POST "$API/project2/test" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# --------------------------------------------------
+# 13. DELETE AN ENDPOINT
+# --------------------------------------------------
+
+# Delete a registered route using your dynamic administrative endpoint.
+# This example assumes admin_delete_endpoint accepts {"path": ..., "method": ...}.
+# Verify its actual input format with the function inspection endpoint first.
+# Do not execute until that input format has been confirmed.
+#
+# curl -i -X POST "$API/admin/endpoints/delete" \
+#   -H "Authorization: Bearer $ADMIN_TOKEN" \
+#   -H "Content-Type: application/json" \
+#   -d '{"path":"/project1/greet","method":"POST"}'
+
+# --------------------------------------------------
+# 14. DELETE A POSTGRESQL FUNCTION
+# --------------------------------------------------
+
+# Delete an unreferenced function from project_one.
+# Its identity argument is jsonb because all generated functions accept p_input jsonb.
+# Remove the endpoint reference before attempting function deletion.
+#
+# curl -i -X POST "$API/admin/functions/delete" \
+#   -H "Authorization: Bearer $ADMIN_TOKEN" \
+#   -H "Content-Type: application/json" \
+#   -d '{"schema_name":"project_one","function_name":"project1_greet","identity_arguments":"jsonb"}'
+
+# --------------------------------------------------
+# 15. VERIFY THE CURRENT CONFIGURATION
+# --------------------------------------------------
+
+# List all endpoints again to verify registered routes.
+curl -i -X POST "$API/admin/endpoints/list" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# List all PostgreSQL functions again.
+curl -i -X POST "$API/admin/functions/list" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Finish.
+echo "PostgreSQL API command reference completed."
