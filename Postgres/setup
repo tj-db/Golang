@@ -1,0 +1,122 @@
+
+#!/bin/bash
+set -Eeuo pipefail
+
+DB_NAME="dbname"
+DB_USER="go-api"
+DB_PASSWORD="CHANGE_THIS_DATABASE_PASSWORD"
+ADMIN_TOKEN="CHANGE_THIS_TO_A_LONG_RANDOM_SECRET"
+
+if [[ "$DB_PASSWORD" == "CHANGE_THIS_DATABASE_PASSWORD" || "$ADMIN_TOKEN" == "CHANGE_THIS_TO_A_LONG_RANDOM_SECRET" ]]; then
+    echo "ERROR: Change DB_PASSWORD and ADMIN_TOKEN before running."
+    exit 1
+fi
+
+echo "Updating system..."
+sudo apt update
+sudo apt upgrade -y
+
+echo "Installing required packages..."
+sudo apt install -y \
+    postgresql \
+    postgresql-contrib \
+    golang-go \
+    git \
+    curl
+
+echo "Starting PostgreSQL..."
+sudo systemctl enable postgresql
+sudo systemctl start postgresql
+
+echo "Creating PostgreSQL role..."
+sudo -u postgres psql -v ON_ERROR_STOP=1 \
+    --set=db_user="$DB_USER" \
+    --set=db_password="$DB_PASSWORD" <<'SQL'
+SELECT format(
+    'CREATE ROLE %I LOGIN PASSWORD %L',
+    :'db_user',
+    :'db_password'
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname = :'db_user'
+)
+\gexec
+
+SELECT format(
+    'ALTER ROLE %I WITH LOGIN PASSWORD %L',
+    :'db_user',
+    :'db_password'
+)
+\gexec
+SQL
+
+echo "Creating database if needed..."
+sudo -u postgres psql -v ON_ERROR_STOP=1 \
+    --set=db_name="$DB_NAME" \
+    --set=db_user="$DB_USER" <<'SQL'
+SELECT format(
+    'CREATE DATABASE %I OWNER %I',
+    :'db_name',
+    :'db_user'
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_database WHERE datname = :'db_name'
+)
+\gexec
+SQL
+
+echo "Configuring routes table and project schema..."
+sudo -u postgres psql \
+    -d "$DB_NAME" \
+    -v ON_ERROR_STOP=1 \
+    --set=db_user="$DB_USER" <<'SQL'
+CREATE TABLE IF NOT EXISTS public.routes (
+    path TEXT NOT NULL,
+    method TEXT NOT NULL,
+    function_name TEXT NOT NULL,
+    schema_name TEXT NOT NULL DEFAULT 'public',
+    PRIMARY KEY (path, method)
+);
+
+ALTER TABLE public.routes
+ADD COLUMN IF NOT EXISTS schema_name TEXT NOT NULL DEFAULT 'public';
+
+GRANT USAGE, CREATE ON SCHEMA public TO :"db_user";
+
+GRANT SELECT, INSERT, UPDATE, DELETE
+ON public.routes TO :"db_user";
+
+SELECT format(
+    'CREATE SCHEMA IF NOT EXISTS project_one AUTHORIZATION %I',
+    :'db_user'
+)
+\gexec
+
+GRANT USAGE, CREATE ON SCHEMA project_one TO :"db_user";
+SQL
+
+echo "Creating Go API environment file..."
+sudo install -m 600 -o root -g root /dev/null /etc/my-go-api.env
+
+sudo tee /etc/my-go-api.env > /dev/null <<EOF
+DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:5432/${DB_NAME}?sslmode=disable
+ADMIN_TOKEN=${ADMIN_TOKEN}
+EOF
+
+sudo chmod 600 /etc/my-go-api.env
+sudo chown root:root /etc/my-go-api.env
+
+mkdir -p "$HOME/golang"
+
+echo "Verifying PostgreSQL..."
+sudo -u postgres psql -d "$DB_NAME" -c "\d public.routes"
+
+echo ""
+echo "=========================================="
+echo "INITIALISATION COMPLETED SUCCESSFULLY"
+echo "=========================================="
+echo "Database: $DB_NAME"
+echo "Role: $DB_USER"
+echo "Project schema: project_one"
+echo "Environment: /etc/my-go-api.env"
+echo "Go directory: $HOME/golang"
