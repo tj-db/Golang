@@ -1,0 +1,4 @@
+curl -i -X POST "$API/admin/create-schema" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"schema_name":"project_one"}'
