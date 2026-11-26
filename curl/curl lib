@@ -7,7 +7,7 @@
 set -e
 
 # Check that the API URL and admin token are available.
-: "${API:?Set API first, for example: API=http://158.101.223.191}"
+: "${API:?Set API first, for example: API=http://111.111.111.111}"
 : "${ADMIN_TOKEN:?Set ADMIN_TOKEN first}"
 
 # Display the API configuration without revealing the admin token.
