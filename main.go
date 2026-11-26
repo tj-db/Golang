@@ -31,14 +31,22 @@ type routeKey struct {
 	Method string
 }
 
+type routeTarget struct {
+	SchemaName   string
+	FunctionName string
+}
+
 type AddEndpointRequest struct {
 	Path         string `json:"path"`
 	Method       string `json:"method"`
+	SchemaName   string `json:"schema_name"`
 	FunctionName string `json:"function_name"`
 	FunctionBody string `json:"function_body"`
+	Language     string `json:"language"`
 }
 
 type DeleteFunctionRequest struct {
+	SchemaName        string `json:"schema_name"`
 	FunctionName      string `json:"function_name"`
 	IdentityArguments string `json:"identity_arguments"`
 }
@@ -146,33 +154,46 @@ func loadRoutes() error {
 
 	rows, err := db.QueryContext(
 		ctx,
-		"SELECT path, method, function_name FROM routes",
+		`SELECT path, method, COALESCE(schema_name, 'public'), function_name
+		 FROM public.routes`,
 	)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
-	m := make(map[routeKey]string)
+	m := make(map[routeKey]routeTarget)
+
 	for rows.Next() {
-		var path, method, fn string
-		if err := rows.Scan(&path, &method, &fn); err != nil {
+		var path, method, schemaName, functionName string
+
+		if err := rows.Scan(&path, &method, &schemaName, &functionName); err != nil {
 			return err
 		}
 
 		method = strings.ToUpper(method)
+
 		if !pathPattern.MatchString(path) {
 			return fmt.Errorf("invalid route path: %s", path)
 		}
+
 		if !validMethod(method) {
 			return fmt.Errorf("invalid HTTP method: %s", method)
 		}
-		if !identifierPattern.MatchString(fn) {
-			return fmt.Errorf("invalid function name: %s", fn)
+
+		if !validSchemaName(schemaName) {
+			return fmt.Errorf("invalid route schema: %s", schemaName)
+		}
+
+		if !identifierPattern.MatchString(functionName) {
+			return fmt.Errorf("invalid function name: %s", functionName)
 		}
 
 		key := routeKey{Path: path, Method: method}
-		m[key] = fn
+		m[key] = routeTarget{
+			SchemaName:   schemaName,
+			FunctionName: functionName,
+		}
 	}
 
 	if err := rows.Err(); err != nil {
@@ -180,27 +201,33 @@ func loadRoutes() error {
 	}
 
 	oldRoutes := routes.Load()
+
 	if oldRoutes != nil {
-		oldMap := oldRoutes.(map[routeKey]string)
+		oldMap := oldRoutes.(map[routeKey]routeTarget)
+
 		if mapsEqual(oldMap, m) {
 			return nil
 		}
 	}
 
 	routes.Store(m)
+
 	log.Printf("Routes updated: %d routes loaded", len(m))
+
 	return nil
 }
 
-func mapsEqual(a, b map[routeKey]string) bool {
+func mapsEqual(a, b map[routeKey]routeTarget) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for k, v := range a {
-		if b[k] != v {
+
+	for key, value := range a {
+		if b[key] != value {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -224,7 +251,37 @@ func quoteIdentifier(name string) (string, error) {
 	if !identifierPattern.MatchString(name) {
 		return "", fmt.Errorf("invalid SQL identifier")
 	}
+
 	return `"` + name + `"`, nil
+}
+
+func validSchemaName(name string) bool {
+	if !identifierPattern.MatchString(name) {
+		return false
+	}
+
+	lowerName := strings.ToLower(name)
+
+	if lowerName == "information_schema" ||
+		strings.HasPrefix(lowerName, "pg_") {
+		return false
+	}
+
+	return true
+}
+
+func schemaExists(ctx context.Context, queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, schemaName string) (bool, error) {
+	var exists bool
+
+	err := queryer.QueryRowContext(
+		ctx,
+		"SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)",
+		schemaName,
+	).Scan(&exists)
+
+	return exists, err
 }
 
 func validMethod(method string) bool {
@@ -236,18 +293,30 @@ func validMethod(method string) bool {
 	}
 }
 
+func validFunctionLanguage(language string) bool {
+	switch language {
+	case "sql", "plpgsql":
+		return true
+	default:
+		return false
+	}
+}
+
 func makeDollarDelimiter(body string) (string, error) {
 	for i := 0; i < 5; i++ {
 		randomBytes := make([]byte, 16)
+
 		if _, err := rand.Read(randomBytes); err != nil {
 			return "", err
 		}
 
 		delimiter := "$api_fn_" + hex.EncodeToString(randomBytes) + "$"
+
 		if !strings.Contains(body, delimiter) {
 			return delimiter, nil
 		}
 	}
+
 	return "", fmt.Errorf("could not generate SQL delimiter")
 }
 
@@ -256,26 +325,31 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "Admin access is not configured", http.StatusServiceUnavailable)
 		return false
 	}
+
 	if !authenticateAdmin(r) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
 	}
+
 	return true
 }
 
 func authenticateAdmin(r *http.Request) bool {
 	token := os.Getenv("ADMIN_TOKEN")
+
 	if token == "" {
 		log.Println("ADMIN_TOKEN is not configured")
 		return false
 	}
 
 	parts := strings.Fields(r.Header.Get("Authorization"))
+
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 		return false
 	}
 
 	providedToken := parts[1]
+
 	return len(providedToken) == len(token) &&
 		subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) == 1
 }
@@ -287,6 +361,7 @@ func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	method := strings.ToUpper(r.Method)
+
 	if !validMethod(method) {
 		w.Header().Set("Allow", "GET, POST, PUT, PATCH, DELETE")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -294,20 +369,29 @@ func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	value := routes.Load()
+
 	if value == nil {
 		http.Error(w, "Routes unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	routeMap := value.(map[routeKey]string)
+	routeMap := value.(map[routeKey]routeTarget)
 	key := routeKey{Path: r.URL.Path, Method: method}
-	fnName, ok := routeMap[key]
+
+	target, ok := routeMap[key]
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 
-	quotedName, err := quoteIdentifier(fnName)
+	quotedSchema, err := quoteIdentifier(target.SchemaName)
+	if err != nil {
+		log.Println("Invalid route schema:", err)
+		http.Error(w, "Invalid route configuration", http.StatusInternalServerError)
+		return
+	}
+
+	quotedFunction, err := quoteIdentifier(target.FunctionName)
 	if err != nil {
 		log.Println("Invalid function name:", err)
 		http.Error(w, "Invalid route configuration", http.StatusInternalServerError)
@@ -318,6 +402,7 @@ func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	input := []byte("{}")
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Could not read request body", http.StatusBadRequest)
@@ -329,6 +414,7 @@ func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
+
 		input = body
 	}
 
@@ -336,7 +422,9 @@ func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var result sql.NullString
-	query := "SELECT " + quotedName + "($1::jsonb)::text"
+
+	query := "SELECT " + quotedSchema + "." + quotedFunction + "($1::jsonb)::text"
+
 	err = db.QueryRowContext(ctx, query, string(input)).Scan(&result)
 	if err != nil {
 		log.Println("Function execution failed:", err)
@@ -345,6 +433,7 @@ func dynamicHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+
 	if result.Valid && json.Valid([]byte(result.String)) {
 		_, _ = w.Write([]byte(result.String))
 	} else {
@@ -358,6 +447,7 @@ func deleteFunctionHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	if !requireAdmin(w, r) {
 		return
 	}
@@ -366,22 +456,34 @@ func deleteFunctionHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var req DeleteFunctionRequest
+
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
+
 	if err := decoder.Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
+	req.SchemaName = strings.TrimSpace(req.SchemaName)
 	req.FunctionName = strings.TrimSpace(req.FunctionName)
-	if !identifierPattern.MatchString(req.FunctionName) {
-		http.Error(w, "Invalid function name", http.StatusBadRequest)
+	req.IdentityArguments = strings.TrimSpace(req.IdentityArguments)
+
+	if req.SchemaName == "" {
+		req.SchemaName = "public"
+	}
+
+	if !validSchemaName(req.SchemaName) ||
+		!identifierPattern.MatchString(req.FunctionName) {
+		http.Error(w, "Invalid schema or function name", http.StatusBadRequest)
 		return
 	}
+
 	if strings.EqualFold(req.FunctionName, "add_route") ||
 		strings.HasPrefix(strings.ToLower(req.FunctionName), "admin_") {
 		http.Error(w, "Protected administrative function", http.StatusForbidden)
@@ -399,42 +501,59 @@ func deleteFunctionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, "LOCK TABLE routes IN ACCESS EXCLUSIVE MODE"); err != nil {
+	if _, err := tx.ExecContext(ctx, "LOCK TABLE public.routes IN ACCESS EXCLUSIVE MODE"); err != nil {
 		log.Println("Route table lock failed:", err)
 		http.Error(w, "Could not safely inspect route references", http.StatusInternalServerError)
 		return
 	}
 
 	var routeInUse bool
-	if err := tx.QueryRowContext(
+
+	err = tx.QueryRowContext(
 		ctx,
-		"SELECT EXISTS (SELECT 1 FROM routes WHERE function_name = $1)",
+		`SELECT EXISTS (
+			SELECT 1
+			FROM public.routes
+			WHERE COALESCE(schema_name, 'public') = $1
+			  AND function_name = $2
+		)`,
+		req.SchemaName,
 		req.FunctionName,
-	).Scan(&routeInUse); err != nil {
+	).Scan(&routeInUse)
+
+	if err != nil {
 		log.Println("Route reference check failed:", err)
 		http.Error(w, "Could not check route references", http.StatusInternalServerError)
 		return
 	}
+
 	if routeInUse {
 		http.Error(w, "Function is still referenced by a registered route", http.StatusConflict)
 		return
 	}
 
 	var dropTarget string
+
 	err = tx.QueryRowContext(ctx, `
 		SELECT format('%I.%I(%s)', n.nspname, p.proname,
 			pg_get_function_identity_arguments(p.oid))
 		FROM pg_proc p
 		JOIN pg_namespace n ON n.oid = p.pronamespace
-		WHERE n.nspname = 'public'
-		  AND p.proname = $1
+		WHERE n.nspname = $1
+		  AND p.proname = $2
 		  AND p.prokind = 'f'
-		  AND pg_get_function_identity_arguments(p.oid) = $2
-	`, req.FunctionName, req.IdentityArguments).Scan(&dropTarget)
+		  AND pg_get_function_identity_arguments(p.oid) = $3
+	`,
+		req.SchemaName,
+		req.FunctionName,
+		req.IdentityArguments,
+	).Scan(&dropTarget)
+
 	if err == sql.ErrNoRows {
 		http.Error(w, "Function signature not found", http.StatusNotFound)
 		return
 	}
+
 	if err != nil {
 		log.Println("Function lookup failed:", err)
 		http.Error(w, "Could not inspect function", http.StatusInternalServerError)
@@ -454,8 +573,10 @@ func deleteFunctionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":             "deleted",
+		"schema_name":        req.SchemaName,
 		"function_name":      req.FunctionName,
 		"identity_arguments": req.IdentityArguments,
 	})
@@ -467,6 +588,7 @@ func addEndpointHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	if !requireAdmin(w, r) {
 		return
 	}
@@ -475,20 +597,42 @@ func addEndpointHandler(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var req AddEndpointRequest
+
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
+
 	if err := decoder.Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	req.Method = strings.ToUpper(req.Method)
+	req.Method = strings.ToUpper(strings.TrimSpace(req.Method))
+	req.Language = strings.ToLower(strings.TrimSpace(req.Language))
+	req.Path = strings.TrimSpace(req.Path)
+	req.SchemaName = strings.TrimSpace(req.SchemaName)
+	req.FunctionName = strings.TrimSpace(req.FunctionName)
+
+	if req.SchemaName == "" {
+		req.SchemaName = "public"
+	}
+
+	if req.Language == "" {
+		req.Language = "sql"
+	}
+
+	if !validFunctionLanguage(req.Language) {
+		http.Error(w, "Unsupported function language. Use sql or plpgsql", http.StatusBadRequest)
+		return
+	}
+
 	if !pathPattern.MatchString(req.Path) ||
 		!validMethod(req.Method) ||
+		!validSchemaName(req.SchemaName) ||
 		!identifierPattern.MatchString(req.FunctionName) ||
 		strings.TrimSpace(req.FunctionBody) == "" ||
 		len(req.FunctionBody) > maxFunctionBodySize {
@@ -496,7 +640,13 @@ func addEndpointHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	quotedName, err := quoteIdentifier(req.FunctionName)
+	quotedSchema, err := quoteIdentifier(req.SchemaName)
+	if err != nil {
+		http.Error(w, "Invalid schema name", http.StatusBadRequest)
+		return
+	}
+
+	quotedFunction, err := quoteIdentifier(req.FunctionName)
 	if err != nil {
 		http.Error(w, "Invalid function name", http.StatusBadRequest)
 		return
@@ -520,15 +670,29 @@ func addEndpointHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 
+	exists, err := schemaExists(ctx, tx, req.SchemaName)
+	if err != nil {
+		log.Println("Schema lookup failed:", err)
+		http.Error(w, "Could not inspect schema", http.StatusInternalServerError)
+		return
+	}
+
+	if !exists {
+		http.Error(w, "Schema does not exist", http.StatusNotFound)
+		return
+	}
+
 	functionSQL := fmt.Sprintf(`
-		CREATE OR REPLACE FUNCTION public.%s(p_input jsonb)
+		CREATE OR REPLACE FUNCTION %s.%s(p_input jsonb)
 		RETURNS jsonb
-		LANGUAGE sql
+		LANGUAGE %s
 		AS %s
 		%s
 		%s
 	`,
-		quotedName,
+		quotedSchema,
+		quotedFunction,
+		req.Language,
 		delimiter,
 		req.FunctionBody,
 		delimiter,
@@ -540,15 +704,19 @@ func addEndpointHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var result string
-	err = tx.QueryRowContext(
+	if _, err := tx.ExecContext(
 		ctx,
-		"SELECT public.add_route($1, $2, $3)",
+		`INSERT INTO public.routes (path, method, schema_name, function_name)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (path, method)
+		 DO UPDATE SET
+			schema_name = EXCLUDED.schema_name,
+			function_name = EXCLUDED.function_name`,
 		req.Path,
 		req.Method,
+		req.SchemaName,
 		req.FunctionName,
-	).Scan(&result)
-	if err != nil {
+	); err != nil {
 		log.Println("Route registration failed:", err)
 		http.Error(w, "Route registration failed", http.StatusBadRequest)
 		return
@@ -568,11 +736,14 @@ func addEndpointHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status":        "success",
 		"message":       "Endpoint created successfully",
 		"path":          req.Path,
 		"method":        req.Method,
+		"schema_name":   req.SchemaName,
 		"function_name": req.FunctionName,
+		"language":      req.Language,
 	})
 }
