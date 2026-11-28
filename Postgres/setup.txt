@@ -1,0 +1,58 @@
+Here's the checklist, in the order you'd do things.
+
+**Before running the script**
+
+- [ ] **Server:** Ubuntu 22.04 or 24.04 (or Debian) with a non-root user that has `sudo`. The script uses `apt`, so other distros won't work.
+- [ ] **Static public IP:** reserve an elastic/static IP with your provider so it doesn't change on reboot.
+- [ ] **Cloud firewall / security group:** allow inbound TCP 22 (SSH), 80 (HTTP) and 443 (HTTPS). Do not open 5432 (Postgres) or 8080 (the Go server), since both only listen locally. Port 80 is needed for certbot to issue and renew the certificate, even though HTTPS redirects afterwards.
+- [ ] **Server firewall (`ufw`):** only if you use it. Allow SSH before enabling it, or you'll lock yourself out:
+
+```bash
+sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+```
+
+- [ ] **DNS:** create an A record for `db.tjdb.online` pointing at the server's public IP. Delete any old AAAA record that points elsewhere, because certbot may validate over IPv6. Confirm it resolves before running:
+
+```bash
+dig +short db.tjdb.online
+```
+
+- [ ] **Cloudflare (if you use it):** set the record to "DNS only" (grey cloud) until certbot succeeds. Check for an existing Cloudflare Tunnel too, since it would conflict with this setup.
+- [ ] **Check what currently serves the domain:** if the old server is still live, decide when to cut over. Also make sure nothing else on the new machine already uses port 80 (Apache, an old nginx, Caddy).
+- [ ] **Outbound internet access:** the script needs `apt` mirrors, Go module downloads (`proxy.golang.org`, GitHub) and Let's Encrypt.
+- [ ] **Valid email address:** certbot sends certificate expiry warnings there.
+- [ ] **Go version:** run `go version` after installing, or expect to check it if the build fails. Ubuntu's packaged Go can be too old for the latest `lib/pq`, and if so you'll need to install a newer Go and re-run.
+- [ ] **Run inside `tmux` or `screen`:** if SSH drops mid-run, the script dies half-finished. Install with `sudo apt install tmux`, start `tmux`, then run `./setup.sh` inside it.
+- [ ] **Something to store the token:** have a password manager open, because the script pauses to show you the admin token.
+
+**While it runs**
+
+- [ ] Copy the admin token and database password when shown, then press Enter.
+- [ ] If certbot fails, the usual causes are DNS not pointing at the server yet, port 80 blocked at the cloud firewall, or a Cloudflare proxy in front.
+
+**After it finishes**
+
+- [ ] Run the map call over HTTPS and expect 2 schemas, 12 functions and 12 routes:
+
+```bash
+curl -sS -X POST https://db.tjdb.online/admin/map \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq '.totals'
+```
+
+- [ ] Delete `~/go-api-credentials.txt` once the token is in your password manager.
+- [ ] Check that certificate auto-renewal works:
+
+```bash
+sudo certbot renew --dry-run
+```
+
+- [ ] Reboot once and confirm everything comes back: `sudo reboot`, then re-run the map call.
+- [ ] Set up backups. The script restores structure only, so schedule `pg_dump` for the `saved_data` rows and keep the output off the server. Provider snapshots are a good second layer.
+- [ ] Optional: restrict `/admin/` to your own IP in nginx, since the admin token can run arbitrary SQL.
+- [ ] Optional: switch SSH to key-only login and disable password logins.
+- [ ] Remember that `admin_list_functions` still holds my overwritten body, and the script goes stale when you add endpoints. After changes, run `/admin/inspect-all` and send me the output.
