@@ -1,58 +1,185 @@
-Here's the checklist, in the order you'd do things.
+ORACLE CLOUD SETUP CHECKLIST FOR setup.sh
+==========================================
 
-**Before running the script**
+Key point: on Oracle Cloud, ports must be opened in TWO places:
+the cloud network (Security List) and the instance's own firewall (iptables).
+Missing either one makes certbot time out.
 
-- [ ] **Server:** Ubuntu 22.04 or 24.04 (or Debian) with a non-root user that has `sudo`. The script uses `apt`, so other distros won't work.
-- [ ] **Static public IP:** reserve an elastic/static IP with your provider so it doesn't change on reboot.
-- [ ] **Cloud firewall / security group:** allow inbound TCP 22 (SSH), 80 (HTTP) and 443 (HTTPS). Do not open 5432 (Postgres) or 8080 (the Go server), since both only listen locally. Port 80 is needed for certbot to issue and renew the certificate, even though HTTPS redirects afterwards.
-- [ ] **Server firewall (`ufw`):** only if you use it. Allow SSH before enabling it, or you'll lock yourself out:
 
-```bash
-sudo ufw allow 22/tcp
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw enable
-```
+PART 1: CREATE THE INSTANCE
+---------------------------
 
-- [ ] **DNS:** create an A record for `db.tjdb.online` pointing at the server's public IP. Delete any old AAAA record that points elsewhere, because certbot may validate over IPv6. Confirm it resolves before running:
+[ ] Image: Ubuntu 22.04 or 24.04. NOT Oracle Linux (it uses dnf, the script
+    uses apt and will fail). The SSH user on Ubuntu images is "ubuntu".
 
-```bash
-dig +short db.tjdb.online
-```
+[ ] Shape: both Always Free shapes work. ARM (Ampere A1) is fine because Go
+    and Postgres support aarch64.
 
-- [ ] **Cloudflare (if you use it):** set the record to "DNS only" (grey cloud) until certbot succeeds. Check for an existing Cloudflare Tunnel too, since it would conflict with this setup.
-- [ ] **Check what currently serves the domain:** if the old server is still live, decide when to cut over. Also make sure nothing else on the new machine already uses port 80 (Apache, an old nginx, Caddy).
-- [ ] **Outbound internet access:** the script needs `apt` mirrors, Go module downloads (`proxy.golang.org`, GitHub) and Let's Encrypt.
-- [ ] **Valid email address:** certbot sends certificate expiry warnings there.
-- [ ] **Go version:** run `go version` after installing, or expect to check it if the build fails. Ubuntu's packaged Go can be too old for the latest `lib/pq`, and if so you'll need to install a newer Go and re-run.
-- [ ] **Run inside `tmux` or `screen`:** if SSH drops mid-run, the script dies half-finished. Install with `sudo apt install tmux`, start `tmux`, then run `./setup.sh` inside it.
-- [ ] **Something to store the token:** have a password manager open, because the script pauses to show you the admin token.
+[ ] 1 GB AMD micro shape only: add swap before running, or "go build" can
+    run out of memory:
 
-**While it runs**
+        sudo fallocate -l 2G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
 
-- [ ] Copy the admin token and database password when shown, then press Enter.
-- [ ] If certbot fails, the usual causes are DNS not pointing at the server yet, port 80 blocked at the cloud firewall, or a Cloudflare proxy in front.
+[ ] Public IP: make sure the instance has a public IPv4 address. Convert it
+    to a Reserved Public IP (Networking > IP management > Reserved public
+    IPs) so it survives instance changes.
 
-**After it finishes**
 
-- [ ] Run the map call over HTTPS and expect 2 schemas, 12 functions and 12 routes:
+PART 2: LAYER 1, THE CLOUD NETWORK
+----------------------------------
 
-```bash
-curl -sS -X POST https://db.tjdb.online/admin/map \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{}' | jq '.totals'
-```
+[ ] In the Oracle console go to:
+    Networking > Virtual cloud networks > your VCN > your subnet >
+    Security List (or the Network Security Group, if the instance uses one).
 
-- [ ] Delete `~/go-api-credentials.txt` once the token is in your password manager.
-- [ ] Check that certificate auto-renewal works:
+[ ] Add an Ingress Rule:
+        Source CIDR:      0.0.0.0/0
+        IP Protocol:      TCP
+        Destination Port: 80
+        Source Port:      leave blank
 
-```bash
-sudo certbot renew --dry-run
-```
+[ ] Add a second Ingress Rule, same as above but Destination Port: 443
 
-- [ ] Reboot once and confirm everything comes back: `sudo reboot`, then re-run the map call.
-- [ ] Set up backups. The script restores structure only, so schedule `pg_dump` for the `saved_data` rows and keep the output off the server. Provider snapshots are a good second layer.
-- [ ] Optional: restrict `/admin/` to your own IP in nginx, since the admin token can run arbitrary SQL.
-- [ ] Optional: switch SSH to key-only login and disable password logins.
-- [ ] Remember that `admin_list_functions` still holds my overwritten body, and the script goes stale when you add endpoints. After changes, run `/admin/inspect-all` and send me the output.
+[ ] Do NOT open 5432 (Postgres) or 8080 (Go server). Both listen locally only.
+
+[ ] Leave the default egress rule (all traffic out). The script needs it.
+
+
+PART 3: LAYER 2, THE INSTANCE FIREWALL
+--------------------------------------
+
+Oracle's Ubuntu images ship with iptables rules that reject everything except
+SSH. Run these BEFORE the script:
+
+        sudo iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+        sudo iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+        sudo netfilter-persistent save
+
+[ ] Verify the two ACCEPT rules sit above the final REJECT line:
+
+        sudo iptables -L INPUT -n --line-numbers
+
+[ ] Do NOT enable ufw on top of this. It is inactive by default on these
+    images, and mixing it with the iptables rules causes conflicts.
+
+
+PART 4: DNS AND DOMAIN
+----------------------
+
+[ ] Create an A record for db.tjdb.online pointing at the reserved public IP.
+
+[ ] Delete any old AAAA record pointing elsewhere (certbot may validate over
+    IPv6).
+
+[ ] Confirm it resolves to the right IP:
+
+        dig +short db.tjdb.online
+
+[ ] Cloudflare users: set the record to "DNS only" (grey cloud) until certbot
+    succeeds. Check for an existing Cloudflare Tunnel too, since it would
+    conflict with this setup.
+
+[ ] Decide when to cut over from whatever serves the domain now.
+
+[ ] Make sure nothing else on the new machine uses port 80 (Apache, an old
+    nginx, Caddy).
+
+
+PART 5: BEFORE YOU RUN THE SCRIPT
+---------------------------------
+
+[ ] Connect over SSH and start tmux, so a dropped connection does not kill
+    the script half-finished:
+
+        sudo apt install -y tmux
+        tmux
+
+[ ] Copy setup.sh to the server, make it executable, run it as your normal
+    user (NOT with sudo):
+
+        scp setup.sh ubuntu@YOUR.SERVER.IP:~/
+        chmod +x setup.sh
+        ./setup.sh
+
+[ ] Have a password manager open. The script pauses to show you the admin
+    token and database password.
+
+[ ] Have a valid email ready. Certbot sends certificate expiry warnings there.
+
+[ ] Outbound internet must work: apt mirrors, Go module downloads
+    (proxy.golang.org, GitHub) and Let's Encrypt.
+
+[ ] Go version: Ubuntu's packaged Go can be too old for the latest lib/pq.
+    If "go mod tidy" or "go build" fails, install a newer Go and re-run.
+
+
+PART 6: WHILE IT RUNS
+---------------------
+
+[ ] Copy the admin token and DB password when shown, then press Enter.
+
+[ ] If certbot fails on Oracle, the cause is almost always one of the two
+    firewall layers. Check the iptables rules first, then the Security List.
+    Other causes: DNS not pointing at the server yet, or a Cloudflare proxy
+    in front.
+
+
+PART 7: AFTER IT FINISHES
+-------------------------
+
+[ ] Confirm the install worked. Expect 2 schemas, 12 functions, 12 routes:
+
+        curl -sS -X POST https://db.tjdb.online/admin/map \
+          -H "Authorization: Bearer YOUR_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{}' | jq '.totals'
+
+[ ] Save the admin token in a password manager, then delete the credentials
+    file:
+
+        rm ~/go-api-credentials.txt
+
+[ ] Test certificate auto-renewal:
+
+        sudo certbot renew --dry-run
+
+[ ] Reboot once and re-run the map call. The iptables rules should survive
+    thanks to "netfilter-persistent save":
+
+        sudo reboot
+
+[ ] Schedule pg_dump backups for the saved_data rows and store them OFF the
+    instance. The script restores structure only, not rows. Oracle boot
+    volume backups are a good second layer.
+
+[ ] Free tier caveat: Oracle can reclaim Always Free instances that sit
+    nearly idle for 7 days. Check the current policy in your account and
+    consider upgrading to pay-as-you-go (free resources stay free) if this
+    server matters.
+
+
+OPTIONAL HARDENING
+------------------
+
+[ ] Restrict /admin/ to your own IP in nginx. The admin token can run
+    arbitrary SQL, so it is the only thing between the internet and your
+    database.
+
+[ ] Keep SSH on key-only login (the default on Oracle images).
+
+
+KNOWN LIMITATIONS
+-----------------
+
+- setup.sh is untested. Try it on a throwaway instance first.
+
+- admin_list_functions holds an overwritten body, not your original.
+
+- setup.sh goes stale when you add endpoints. After changes, call
+  /admin/inspect-all and regenerate the embedded SQL blocks.
+
+- Data rows in project_one.saved_data, roles beyond go-api, and grants
+  beyond those in the script are not restored.
