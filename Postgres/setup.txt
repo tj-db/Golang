@@ -1,3 +1,7 @@
+// Designed and written by Thomas de Beer.
+// Do not use, copy or reproduce without his explicit written consent.
+// Contact: tjdebeer@gmail.com
+
 ORACLE CLOUD SETUP CHECKLIST FOR setup.sh
 ==========================================
 
