@@ -173,17 +173,3 @@ OPTIONAL HARDENING
     database.
 
 [ ] Keep SSH on key-only login (the default on Oracle images).
-
-
-KNOWN LIMITATIONS
------------------
-
-- setup.sh is untested. Try it on a throwaway instance first.
-
-- admin_list_functions holds an overwritten body, not your original.
-
-- setup.sh goes stale when you add endpoints. After changes, call
-  /admin/inspect-all and regenerate the embedded SQL blocks.
-
-- Data rows in project_one.saved_data, roles beyond go-api, and grants
-  beyond those in the script are not restored.
